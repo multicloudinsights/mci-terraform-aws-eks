@@ -1,10 +1,3 @@
-# create fargate profiles
-
-# cluster security group
-
-# node security group
-
-# enable logging
 resource "aws_eks_cluster" "this" {
   name     = "${var.resourcename_prefix}-cluster"
   version  = "1.33"
@@ -15,10 +8,20 @@ resource "aws_eks_cluster" "this" {
   }
 
   vpc_config {
-    subnet_ids = var.subnet_ids
+    subnet_ids              = var.subnet_ids
+    endpoint_private_access = true
+    endpoint_public_access  = false
+    security_group_ids      = []
   }
 
   enabled_cluster_log_types = var.cluster_log_types
+
+  encryption_config {
+    provider {
+      key_arn = aws_kms_key.eks.arn
+    }
+    resources = ["secrets"]
+  }
 
   depends_on = [
     aws_iam_role_policy_attachment.cluster
@@ -49,6 +52,10 @@ resource "aws_iam_role_policy_attachment" "cluster" {
   role       = aws_iam_role.cluster.name
 }
 
+data "aws_ssm_parameter" "eks_ami_release_version" {
+  name = "/aws/service/eks/optimized-ami/${aws_eks_cluster.this.version}/amazon-linux-2/recommended/release_version"
+}
+
 resource "aws_eks_node_group" "this" {
   cluster_name    = aws_eks_cluster.this.name
   node_group_name = "${var.resourcename_prefix}-cluster-node-group"
@@ -57,6 +64,12 @@ resource "aws_eks_node_group" "this" {
   capacity_type   = "ON_DEMAND"
   disk_size       = 20
   instance_types  = var.instance_types
+  release_version = nonsensitive(data.aws_ssm_parameter.eks_ami_release_version.value)
+  ami_type        = "AL2_x86_64"
+
+  # remote_access {
+  #   ec2_ssh_key = ""
+  # }
 
   scaling_config {
     desired_size = 2
@@ -66,6 +79,10 @@ resource "aws_eks_node_group" "this" {
 
   update_config {
     max_unavailable = 1
+  }
+
+  lifecycle {
+    create_before_destroy = true
   }
 
   depends_on = [
@@ -121,4 +138,27 @@ resource "aws_eks_access_policy_association" "this" {
   access_scope {
     type = "cluster"
   }
+}
+
+locals {
+  autoscaling_group_name = flatten(aws_eks_node_group.this.resources.autoscaling_group.name)
+}
+
+resource "aws_autoscaling_group_tag" "eks-worker-nodes" {
+  autoscaling_group_name = local.autoscaling_group_name
+
+  tag {
+    key                 = "Name"
+    value               = "aws-eks-cluster-nodes"
+    propagate_at_launch = true
+  }
+}
+
+# Manage EKS add-on's
+resource "aws_eks_addon" "eks-cluster-add-on" {
+  count                       = length(var.add-ons)
+  cluster_name                = aws_eks_cluster.this.name
+  addon_name                  = var.add-ons[count.index]
+  addon_version               = var.add-ons-version[count.index]
+  resolve_conflicts_on_update = "PRESERVE"
 }
